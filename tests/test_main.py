@@ -981,3 +981,77 @@ def test_login_exhausts_retries_then_fails(monkeypatch):
 
     assert calls["login"] == 3
     assert bm.authenticated is False
+
+
+class _FakeLoginPage:
+    def is_closed(self):
+        return False
+
+    async def close(self):
+        pass
+
+
+class _FakeLoginContext:
+    async def new_page(self):
+        return _FakeLoginPage()
+
+
+def _make_login_manager(monkeypatch, login_impl):
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(main, "login", login_impl)
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    manager = main.BrowserManager()
+    manager.context = _FakeLoginContext()
+    return manager, sleeps
+
+
+def test_login_does_not_retry_after_spid_completed(monkeypatch):
+    calls = []
+
+    async def fake_login(page):
+        calls.append(page)
+        raise main.SpidAuthCompletedError("cerca_sister timeout")
+
+    manager, _ = _make_login_manager(monkeypatch, fake_login)
+
+    with pytest.raises(main.AuthenticationError):
+        asyncio.run(manager.login())
+
+    assert len(calls) == 1
+    assert manager._last_spid_auth_monotonic is not None
+
+
+def test_login_waits_cooldown_after_recent_spid_auth(monkeypatch):
+    monkeypatch.setenv("LOGIN_COOLDOWN_S", "60")
+
+    async def fake_login(page):
+        return None
+
+    manager, sleeps = _make_login_manager(monkeypatch, fake_login)
+    manager._last_spid_auth_monotonic = main.time.monotonic() - 10
+
+    asyncio.run(manager.login())
+
+    assert len(sleeps) == 1
+    assert 45 < sleeps[0] <= 50
+
+
+def test_login_still_retries_when_push_not_approved(monkeypatch):
+    monkeypatch.setenv("LOGIN_MAX_ATTEMPTS", "2")
+    calls = []
+
+    async def fake_login(page):
+        calls.append(page)
+        if len(calls) == 1:
+            raise main.PlaywrightTimeoutError("push non approvata")
+
+    manager, _ = _make_login_manager(monkeypatch, fake_login)
+
+    asyncio.run(manager.login())
+
+    assert len(calls) == 2
+    assert manager.authenticated is True

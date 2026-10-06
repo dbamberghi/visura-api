@@ -10,6 +10,7 @@ import time
 import unicodedata
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 from playwright.async_api import Page
@@ -272,6 +273,25 @@ async def _login_sielte(page: Page, logger: PageLogger, username: str, password:
         raise
 
 
+class SpidAuthCompletedError(RuntimeError):
+    """L'autenticazione SPID e' andata a buon fine ma un passo successivo e' fallito.
+
+    Va trattato come non ritentabile nell'immediato: un nuovo login SPID a
+    pochi secondi dal precedente viene rifiutato dal portale ADE.
+    """
+
+
+def _is_agenzia_entrate_url(url: str) -> bool:
+    """True se l'URL e' su agenziaentrate.gov.it o su un suo sottodominio.
+
+    Il ritorno dall'IdP SPID passa per host diversi (sp., portale., iampe.):
+    un glob come ``**/agenziaentrate.gov.it/**`` non li riconosce perche'
+    richiede uno ``/`` subito prima del dominio.
+    """
+    host = urlparse(url).hostname or ""
+    return host == "agenziaentrate.gov.it" or host.endswith(".agenziaentrate.gov.it")
+
+
 async def _login_poste(page: Page, logger: PageLogger, username: str, password: str) -> None:
     """Esegue l'autenticazione SPID tramite provider Poste Italiane (PosteID).
 
@@ -280,48 +300,52 @@ async def _login_poste(page: Page, logger: PageLogger, username: str, password: 
         POSTE_PASSWORD — password dell'account PosteID
 
     Il secondo fattore è gestito tramite notifica push sull'app PosteID:
-    l'utente approva sull'app e la pagina si reindirizza automaticamente
+    dopo le credenziali si sceglie "ricevere una notifica sull'App PosteID",
+    l'utente approva sull'app, si accetta il consenso all'invio dei dati e la pagina si reindirizza automaticamente
     sul dominio agenziaentrate.gov.it (timeout 120s).
     """
     step = "poste_id"
     try:
         print("[LOGIN] Clicco 'Poste Italiane'...")
         await page.locator('a[href*="poste"]').click()
+        # Il click porta su una pagina ADE intermedia con un form SAML
+        # auto-submit (POST verso posteid.poste.it/jod-fs/ssoservicepost) che
+        # a sua volta reindirizza al form di login PosteID. Attendiamo
+        # esplicitamente l'atterraggio sul form per non loggare la pagina
+        # intermedia e per avere un errore chiaro se il redirect non avviene.
+        await page.wait_for_url("**/posteid.poste.it/jod-login-schema/**", timeout=30000)
+        await page.wait_for_load_state("domcontentloaded")
         await logger.log(page, "poste_id")
 
         step = "username"
         print("[LOGIN] Inserisco email PosteID...")
-        await page.get_by_role("textbox", name="Indirizzo e-mail").fill(username)
+        await page.get_by_role("textbox", name="Nome utente").fill(username)
         await logger.log(page, "username")
 
         step = "password"
         print("[LOGIN] Inserisco password PosteID...")
-        await page.get_by_role("textbox", name="Password").fill(password)
+        password_box = page.get_by_role("textbox", name="Password")
+        await password_box.fill(password)
 
-        step = "avanti"
-        print("[LOGIN] Clicco 'Avanti'...")
-        await page.get_by_role("button", name="Avanti").click()
-        await logger.log(page, "avanti")
+        step = "entra_con_spid"
+        print("[LOGIN] Clicco 'Entra con SPID'...")
+        await page.get_by_role("button", name="Entra con SPID").click()
+        await logger.log(page, "entra_con_spid")
 
         step = "attesa_app"
-        # Fail-fast: dopo 'Avanti' PosteID transita a uno step di approvazione
+        # Fail-fast: dopo il submit PosteID transita a uno step di approvazione
         # push e poi reindirizza al dominio agenziaentrate. Se username/password
-        # sono sbagliate la pagina mostra subito un errore senza mai partire la
-        # push; aspettare 120s prima di accorgersene non e' utile. Diamo prima
-        # ``LOGIN_POSTE_PUSH_APPEAR_TIMEOUT_S`` per il cambio di URL/stato e
-        # poi il timeout lungo per l'approvazione vera e propria.
+        # sono sbagliate la pagina resta sul form con un errore senza mai
+        # partire la push; aspettare 120s prima di accorgersene non e' utile.
+        # Non possiamo basarci sull'URL (anche gli step successivi stanno sotto
+        # /jod-login-schema/), quindi attendiamo che il campo password sparisca.
         appear_timeout_s = int(os.getenv("LOGIN_POSTE_PUSH_APPEAR_TIMEOUT_S", "15"))
         print(
             f"[LOGIN] Attendo transizione push PosteID (max {appear_timeout_s}s) — "
             f"se rimane sulla form = credenziali probabilmente errate"
         )
         try:
-            # Attendiamo che l'URL CAMBI dalla pagina di login. wait_for_url
-            # con un pattern wildcard fallisce se restiamo sullo stesso URL.
-            await page.wait_for_function(
-                "url => !window.location.href.includes('login') && !window.location.href.includes('Login')",
-                timeout=appear_timeout_s * 1000,
-            )
+            await password_box.wait_for(state="hidden", timeout=appear_timeout_s * 1000)
         except PlaywrightTimeoutError as e:
             current_url = page.url
             await logger.log(page, f"ERRORE_poste_{step}_push_non_partita")
@@ -330,11 +354,64 @@ async def _login_poste(page: Page, logger: PageLogger, username: str, password: 
                 f"entro {appear_timeout_s}s. Credenziali probabilmente errate o "
                 f"flusso PosteID modificato. URL corrente: {current_url}"
             ) from e
+        await logger.log(page, "scelta_verifica")
+        print(f"[LOGIN] Pagina PosteID dopo il submit: {page.url}")
+
+        step = "scelta_notifica"
+        # Per il livello 2 SPID PosteID mostra una pagina di scelta tra
+        # "Voglio ricevere una notifica sull'App PosteID" e "Preferisco
+        # generare un PIN temporaneo". La push parte solo dopo aver scelto la
+        # notifica: selezioniamo l'opzione per testo, non per posizione, perche'
+        # l'ordine delle voci non e' garantito.
+        notifica = page.get_by_text(re.compile(r"ricevere una notifica", re.IGNORECASE)).first
+        try:
+            await notifica.wait_for(state="visible", timeout=appear_timeout_s * 1000)
+        except PlaywrightTimeoutError as e:
+            current_url = page.url
+            await logger.log(page, f"ERRORE_poste_{step}_opzione_non_trovata")
+            raise RuntimeError(
+                f"Login PosteID fallito: opzione 'ricevere una notifica sull'App "
+                f"PosteID' non trovata entro {appear_timeout_s}s. Flusso PosteID "
+                f"probabilmente modificato. URL corrente: {current_url}"
+            ) from e
+        print("[LOGIN] Scelgo 'Voglio ricevere una notifica sull'App PosteID'...")
+        await notifica.click()
+        await logger.log(page, "attesa_push")
+
+        step = "attesa_app"
 
         print("[LOGIN] Attendo approvazione sull'app PosteID (timeout 120s)...")
-        # PosteID reindirizza automaticamente dopo l'approvazione sull'app:
-        # aspettiamo che il browser torni sul dominio agenziaentrate.
-        await page.wait_for_url("**/agenziaentrate.gov.it/**", timeout=120000)
+        # Dopo l'approvazione sull'app PosteID mostra (di norma) una pagina di
+        # consenso all'invio dei dati (consent.jsp) prima di reindirizzare su
+        # agenziaentrate. Attendiamo l'una o l'altra cosi' da gestire anche il
+        # caso in cui il consenso non venga richiesto.
+        await page.wait_for_url(
+            lambda url: "/consent" in url or _is_agenzia_entrate_url(url),
+            timeout=120000,
+        )
+
+        if "/consent" in page.url:
+            step = "consenso"
+            await logger.log(page, "consenso")
+            # Match esatto (case-insensitive: il testo e' reso in maiuscolo) per
+            # non cliccare per errore "Non acconsento".
+            acconsento_name = re.compile(r"^\s*acconsento\s*$", re.IGNORECASE)
+            acconsento = (
+                page.get_by_role("button", name=acconsento_name)
+                .or_(page.get_by_role("link", name=acconsento_name))
+                .first
+            )
+            print("[LOGIN] Clicco 'Acconsento' (invio dati ad Agenzia delle Entrate)...")
+            await acconsento.click()
+            try:
+                await page.wait_for_url(_is_agenzia_entrate_url, timeout=30000)
+            except PlaywrightTimeoutError as e:
+                await logger.log(page, f"ERRORE_poste_{step}_redirect_mancato")
+                raise SpidAuthCompletedError(
+                    f"Consenso PosteID inviato ma redirect su agenziaentrate non "
+                    f"rilevato entro 30s. URL corrente: {page.url}"
+                ) from e
+
         await logger.log(page, "redirect_post_auth")
     except Exception:
         await logger.log(page, f"ERRORE_poste_{step}")
@@ -386,6 +463,7 @@ async def login(page: Page):
 
     logger = PageLogger("login")
     step = "init"
+    spid_completed = False
 
     try:
         step = "goto_login"
@@ -413,6 +491,7 @@ async def login(page: Page):
             await _login_sielte(page, logger, username, password)
         else:  # poste (gli altri valori sono già stati respinti sopra)
             await _login_poste(page, logger, username, password)
+        spid_completed = True
 
         step = "cerca_sister"
         print("[LOGIN] Cerco servizio SISTER...")
@@ -456,6 +535,15 @@ async def login(page: Page):
         await page.get_by_role("link", name="Conferma Lettura").click()
         await logger.log(page, "conferma_lettura")
 
+    except PlaywrightTimeoutError as e:
+        await logger.log(page, f"ERRORE_{step}")
+        if spid_completed:
+            # SPID ok, fallita la navigazione successiva: non e' una push
+            # mancata e un nuovo login immediato verrebbe rifiutato da ADE.
+            raise SpidAuthCompletedError(
+                f"Autenticazione SPID completata ma step '{step}' fallito per timeout: {e}"
+            ) from e
+        raise
     except Exception:
         await logger.log(page, f"ERRORE_{step}")
         raise

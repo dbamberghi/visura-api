@@ -677,3 +677,20 @@ def test_invalidate_dropdown_cache_clears_state():
     utils._DROPDOWN_CACHE[("comune", "")] = {"items": [], "by_norm": {}, "by_belfiore": {}}
     utils.invalidate_dropdown_cache(reason="unit_test")
     assert utils._DROPDOWN_CACHE == {}
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://portale.agenziaentrate.gov.it/PortaleWeb/home", True),
+        ("https://sp.agenziaentrate.gov.it/make4SAM", True),
+        ("https://agenziaentrate.gov.it/", True),
+        ("https://posteid.poste.it/jod-login-schema/consent.jsp", False),
+        ("https://evil.example/?next=agenziaentrate.gov.it", False),
+        ("https://fakeagenziaentrate.gov.it/", False),
+    ],
+)
+def test_is_agenzia_entrate_url(url, expected):
+    from utils import _is_agenzia_entrate_url
+
+    assert _is_agenzia_entrate_url(url) is expected

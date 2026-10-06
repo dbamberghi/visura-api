@@ -33,7 +33,15 @@ from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field, field_validator
 
-from utils import PageLogger, extract_all_sezioni, login, logout, run_visura, run_visura_immobile
+from utils import (
+    PageLogger,
+    SpidAuthCompletedError,
+    extract_all_sezioni,
+    login,
+    logout,
+    run_visura,
+    run_visura_immobile,
+)
 
 # Carica variabili d'ambiente da .env
 load_dotenv()
@@ -153,6 +161,9 @@ class BrowserManager:
         self.authenticated = False
         self.keep_alive_running = False
         self.last_login_time = None
+        # Ultimo tentativo SPID arrivato almeno all'autenticazione (riuscito o
+        # fallito dopo): usato per il cooldown tra login ravvicinati.
+        self._last_spid_auth_monotonic: Optional[float] = None
         # Stats per resource blocking (popolato in initialize → context.route)
         self.blocked_resources_count: int = 0
         self.blocked_resources_samples: list = []  # primi N URL bloccati per diagnostica
@@ -225,8 +236,11 @@ class BrowserManager:
                 self.playwright = None
 
             self.playwright = await async_playwright().start()
+            # HEADLESS=0 mostra la finestra di Chromium: utile in debug locale
+            # per vedere cosa succede sui portali (non usare in Docker/server).
+            headless = os.getenv("HEADLESS", "1") != "0"
             self.browser = await self.playwright.chromium.launch(
-                headless=True,
+                headless=headless,
                 handle_sigint=False,  # Non chiudere Chromium su Ctrl+C — gestiamo noi il logout
                 handle_sigterm=False,  # Idem per SIGTERM
                 args=[
@@ -270,15 +284,28 @@ class BrowserManager:
           per Sielte o sul redirect post-push per Poste). Ritentiamo fino a
           ``LOGIN_MAX_ATTEMPTS`` (default 3) volte, con un breve sleep tra
           tentativi per evitare push back-to-back.
+
+        Tra un'autenticazione SPID completata e il login successivo si attende
+        almeno ``LOGIN_COOLDOWN_S`` secondi (default 60).
+        * ``SpidAuthCompletedError`` — SPID riuscito ma navigazione successiva
+          fallita: nessun retry immediato, ADE rifiuterebbe un nuovo login.
         * Altri errori (``RuntimeError`` fail-fast su credenziali sbagliate,
           ``BrowserError``, ecc.) — falliscono al primo colpo perche'
           ritentare e' inutile (le credenziali errate restano errate).
         """
         max_attempts = max(1, int(os.getenv("LOGIN_MAX_ATTEMPTS", "3")))
         retry_delay_s = max(0, int(os.getenv("LOGIN_RETRY_DELAY_S", "5")))
+        cooldown_s = max(0, int(os.getenv("LOGIN_COOLDOWN_S", "60")))
         last_exc: Optional[Exception] = None
 
         for attempt in range(1, max_attempts + 1):
+            # ADE rifiuta un login SPID troppo vicino a un'autenticazione
+            # appena completata: rispettiamo un intervallo minimo.
+            if self._last_spid_auth_monotonic is not None:
+                wait_s = cooldown_s - (time.monotonic() - self._last_spid_auth_monotonic)
+                if wait_s > 0:
+                    logger.info(f"Attendo {wait_s:.0f}s (LOGIN_COOLDOWN_S) dall'ultima autenticazione SPID")
+                    await asyncio.sleep(wait_s)
             try:
                 # Chiudi la vecchia pagina prima di crearne una nuova
                 if self.auth_page and not self.auth_page.is_closed():
@@ -291,6 +318,7 @@ class BrowserManager:
                 page = await self.context.new_page()
                 logger.info(f"Tentativo login {attempt}/{max_attempts}")
                 await login(page)
+                self._last_spid_auth_monotonic = time.monotonic()
                 self.auth_page = page
                 self.authenticated = True
                 self.last_login_time = datetime.now()
@@ -311,6 +339,14 @@ class BrowserManager:
                         f"(controlla l'app SPID per la prossima notifica push)"
                     )
                     await asyncio.sleep(retry_delay_s)
+            except SpidAuthCompletedError as e:
+                # SPID riuscito ma passi successivi falliti: niente retry
+                # immediato (ADE lo rifiuterebbe), ma registriamo l'istante
+                # per il cooldown di un eventuale login successivo.
+                self._last_spid_auth_monotonic = time.monotonic()
+                logger.error(f"Login SPID riuscito ma navigazione successiva fallita: {e}")
+                self.authenticated = False
+                raise AuthenticationError(f"Login failed after SPID authentication: {e}") from e
             except Exception as e:
                 # Errori non-timeout (credenziali errate, browser crash, ecc.):
                 # fail-fast, non ritentare.
