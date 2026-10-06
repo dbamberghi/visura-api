@@ -495,14 +495,23 @@ async def login(page: Page):
 
         step = "cerca_sister"
         print("[LOGIN] Cerco servizio SISTER...")
-        await page.get_by_role("textbox", name="Cerca il servizio").click()
-        await page.get_by_role("textbox", name="Cerca il servizio").fill("SISTER")
-        await page.get_by_role("textbox", name="Cerca il servizio").press("Enter")
+        # Il campo ha un <datalist> di suggerimenti, quindi il suo ruolo ARIA e'
+        # "combobox" e non "textbox": lo selezioniamo per attributo name.
+        cerca = page.locator('input[name="cerca"]')
+        await cerca.click()
+        await cerca.fill("SISTER")
+        await page.get_by_role("button", name="Cerca", exact=True).click()
         await logger.log(page, "cerca_sister")
 
         step = "vai_al_servizio"
-        print("[LOGIN] Clicco 'Vai al servizio'...")
-        await page.get_by_role("link", name="Vai al servizio").first.click()
+        print("[LOGIN] Clicco 'Vai al servizio' sulla card 'Sister'...")
+        # Tra i risultati compare anche "Adesione ai servizi Sister" e la home
+        # mostra le card dei preferiti, tutte con un link "Vai al servizio":
+        # prendiamo quello della card il cui titolo e' esattamente "Sister".
+        sister_card = page.locator(".card").filter(
+            has=page.get_by_role("heading", name=re.compile(r"^\s*sister\s*$", re.IGNORECASE))
+        )
+        await sister_card.get_by_role("link", name="Vai al servizio").first.click()
 
         step = "controllo_sessione"
         print("[LOGIN] Attendo caricamento pagina...")
